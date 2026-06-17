@@ -1,0 +1,75 @@
+# autobackup 配置文件示例
+# 复制为 config.yaml 后按需修改
+
+global:
+  backup_dir: ./backups          # 备份文件存放目录
+  log_dir: ./logs                # 日志目录
+  retention_days: 30             # 默认保留天数
+  notify_on_success: false       # 成功时是否通知（默认 false）
+
+  # Web 管理界面
+  web:
+    host: 0.0.0.0
+    port: 8080
+    token: ${WEB_TOKEN}          # 可选，留空则无需认证
+
+# 通知配置（失败时至少启用一种渠道）
+notification:
+  email:
+    enabled: false
+    smtp_host: smtp.example.com
+    smtp_port: 587
+    use_tls: true
+    username: backup@example.com
+    password: ${SMTP_PASSWORD}   # 推荐从环境变量读取
+    from_addr: backup@example.com
+    to_addrs:
+      - admin@example.com
+
+  dingtalk:
+    enabled: false
+    webhook: https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN
+
+  wecom:
+    enabled: false
+    webhook: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY
+
+  feishu:
+    enabled: false
+    webhook: https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_TOKEN
+
+tasks:
+  # MySQL 数据库备份
+  - name: mysql_prod
+    type: mysql
+    enabled: true
+    schedule: "0 2 * * *"        # 每天凌晨 2 点
+    retention_days: 7            # 可选，覆盖全局保留天数
+    database:
+      host: localhost
+      port: 3306
+      user: root
+      password: ${MYSQL_PASSWORD}
+      database: myapp
+
+  # PostgreSQL 数据库备份
+  - name: pg_prod
+    type: postgresql
+    enabled: true
+    schedule: "0 3 * * *"
+    database:
+      host: localhost
+      port: 5432
+      user: postgres
+      password: ${PG_PASSWORD}
+      database: myapp
+
+  # 文件目录备份
+  - name: nginx_config
+    type: file
+    enabled: true
+    schedule: "0 4 * * 0"        # 每周日凌晨 4 点
+    source: /etc/nginx
+    exclude:
+      - "*.log"
+      - "*.tmp"

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+logs/
+backups/
+config.yaml
+*.log
+.idea/
+.DS_Store
+*.iml
