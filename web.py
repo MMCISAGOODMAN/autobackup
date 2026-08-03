@@ -8,7 +8,7 @@ import threading
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 import yaml
 from flask import Flask, jsonify, render_template, request, send_file
@@ -19,18 +19,17 @@ from autobackup import (
     Scheduler,
     __version__,
     build_task_info,
-    execute_task,
     format_size,
     get_task_by_name,
     list_backup_files,
     load_config,
     save_config,
+    task_runner,
 )
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
 _state: Dict[str, Any] = {}
-_run_lock = threading.Lock()
 
 
 def _get_token() -> str:
@@ -59,6 +58,9 @@ def _reload_config() -> None:
     scheduler = _state.get("scheduler")
     if scheduler:
         scheduler.reload_config(_state["config"])
+    notifier = _state.get("notifier")
+    if notifier:
+        notifier.update_config(_state["config"])
 
 
 def _global_cfg() -> Dict[str, Any]:
@@ -74,13 +76,16 @@ def _safe_backup_path(filename: str) -> Optional[Path]:
     return None
 
 
-def _run_task_async(task_name: str) -> bool:
+def _run_task_async(task_name: str) -> tuple[bool, str]:
     task = get_task_by_name(_state["config"], task_name)
     if not task:
-        return False
+        return False, f"任务不存在: {task_name}"
+    if not task_runner.try_acquire(task_name):
+        return False, f"任务 {task_name} 正在运行中"
 
     def _job():
-        with _run_lock:
+        try:
+            from autobackup import execute_task
             execute_task(
                 task,
                 _global_cfg(),
@@ -88,9 +93,11 @@ def _run_task_async(task_name: str) -> bool:
                 _state["logger"],
                 _state["history"],
             )
+        finally:
+            task_runner.release(task_name)
 
     threading.Thread(target=_job, daemon=True, name=f"backup-{task_name}").start()
-    return True
+    return True, f"任务 {task_name} 已在后台启动"
 
 
 @app.route("/")
@@ -108,10 +115,13 @@ def api_status():
     tasks = config.get("tasks", [])
     backups = list_backup_files(config)
     total_size = sum(b["size_bytes"] for b in backups)
+    running = task_runner.list_running()
 
     return jsonify({
         "version": __version__,
         "scheduler_running": scheduler.is_running if scheduler else False,
+        "running_tasks": running,
+        "running_count": len(running),
         "task_count": len(tasks),
         "enabled_task_count": sum(1 for t in tasks if t.get("enabled", True)),
         "backup_count": len(backups),
@@ -130,7 +140,7 @@ def api_status():
 def api_tasks():
     global_cfg = _global_cfg()
     tasks = [
-        build_task_info(task, global_cfg)
+        build_task_info(task, global_cfg, task_runner)
         for task in _state["config"].get("tasks", [])
     ]
     return jsonify({"tasks": tasks})
@@ -139,12 +149,11 @@ def api_tasks():
 @app.route("/api/tasks/<name>/run", methods=["POST"])
 @require_auth
 def api_run_task(name: str):
-    task = get_task_by_name(_state["config"], name)
-    if not task:
-        return jsonify({"error": f"任务不存在: {name}"}), 404
-    if not _run_task_async(name):
-        return jsonify({"error": "启动失败"}), 500
-    return jsonify({"ok": True, "message": f"任务 {name} 已在后台启动"})
+    ok, message = _run_task_async(name)
+    if not ok:
+        status = 404 if "不存在" in message else 409
+        return jsonify({"error": message}), status
+    return jsonify({"ok": True, "message": message})
 
 
 @app.route("/api/tasks/<name>/toggle", methods=["POST"])
@@ -240,6 +249,25 @@ def api_save_config():
     _reload_config()
     _state["logger"].info("Web 界面更新了配置文件")
     return jsonify({"ok": True, "message": "配置已保存"})
+
+
+@app.route("/api/notify/test", methods=["POST"])
+@require_auth
+def api_test_notify():
+    results = _state["notifier"].test()
+    enabled = [k for k, v in results.items() if not v.get("skipped")]
+    if not enabled:
+        return jsonify({
+            "ok": False,
+            "error": "未启用任何通知渠道",
+            "results": results,
+        }), 400
+    failed = [k for k, v in results.items() if not v.get("skipped") and not v.get("ok")]
+    return jsonify({
+        "ok": len(failed) == 0,
+        "message": "全部发送成功" if not failed else f"部分失败: {', '.join(failed)}",
+        "results": results,
+    })
 
 
 def run_web_server(

@@ -4,7 +4,8 @@
 global:
   backup_dir: ./backups          # 备份文件存放目录
   log_dir: ./logs                # 日志目录
-  retention_days: 30             # 默认保留天数
+  retention_days: 30             # 默认保留天数（0=不按天清理）
+  retention_count: 0             # 默认最多保留份数（0=不按份数清理）
   notify_on_success: false       # 成功时是否通知（默认 false）
 
   # Web 管理界面
@@ -45,6 +46,7 @@ tasks:
     enabled: true
     schedule: "0 2 * * *"        # 每天凌晨 2 点
     retention_days: 7            # 可选，覆盖全局保留天数
+    retention_count: 14          # 可选，最多保留 14 份
     database:
       host: localhost
       port: 3306

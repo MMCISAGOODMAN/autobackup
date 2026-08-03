@@ -33,7 +33,7 @@ from croniter import croniter
 
 GRACE_SECONDS = 120  # 调度器启动后，允许在计划时间后 2 分钟内补跑
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 ENV_PATTERN = re.compile(r"\$\{([^}]+)\}")
 ENC_PREFIX = "enc:"
@@ -236,6 +236,9 @@ class Notifier:
         self.config = config.get("notification", {})
         self.logger = logger
 
+    def update_config(self, config: Dict[str, Any]) -> None:
+        self.config = config.get("notification", {})
+
     def notify_failure(self, subject: str, message: str) -> None:
         self.logger.error("备份失败通知: %s - %s", subject, message)
         self._send_all(subject, message, force=True)
@@ -245,6 +248,35 @@ class Notifier:
             return
         self.logger.info("备份成功通知: %s", subject)
         self._send_all(subject, message, force=False)
+
+    def test(self) -> Dict[str, Dict[str, Any]]:
+        """向所有已启用渠道发送测试通知，返回各渠道结果。"""
+        subject = "[autobackup] 通知测试"
+        message = (
+            "这是一条来自 autobackup 的测试通知。\n"
+            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            "若你收到此消息，说明该通知渠道配置正常。"
+        )
+        results: Dict[str, Dict[str, Any]] = {}
+        senders = {
+            "email": self._send_email,
+            "dingtalk": self._send_dingtalk,
+            "wecom": self._send_wecom,
+            "feishu": self._send_feishu,
+        }
+        for name, sender in senders.items():
+            channel = self.config.get(name, {})
+            if not channel.get("enabled"):
+                results[name] = {"ok": False, "skipped": True, "error": "未启用"}
+                continue
+            try:
+                sender(subject, message, resolve_value(channel))
+                results[name] = {"ok": True, "skipped": False, "error": None}
+                self.logger.info("通知测试成功: %s", name)
+            except Exception as exc:
+                results[name] = {"ok": False, "skipped": False, "error": str(exc)}
+                self.logger.exception("通知测试失败 (%s)", name)
+        return results
 
     def _send_all(self, subject: str, message: str, force: bool) -> None:
         errors = []
@@ -351,12 +383,16 @@ def cleanup_old_backups(
     retention_days: int,
     extensions: Tuple[str, ...],
     logger: logging.Logger,
+    retention_count: int = 0,
 ) -> None:
-    if retention_days <= 0:
+    """按天数和/或保留份数清理备份。两者都配置时先按天再按份数。"""
+    if retention_days <= 0 and retention_count <= 0:
         return
-    cutoff = datetime.now() - timedelta(days=retention_days)
+    if not backup_dir.exists():
+        return
+
     prefix = f"{name}_"
-    removed = 0
+    files: List[Path] = []
     for path in backup_dir.iterdir():
         if not path.is_file():
             continue
@@ -364,11 +400,28 @@ def cleanup_old_backups(
             continue
         if not any(path.name.endswith(ext) for ext in extensions):
             continue
-        mtime = datetime.fromtimestamp(path.stat().st_mtime)
-        if mtime < cutoff:
+        files.append(path)
+
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    removed = 0
+    keep: List[Path] = list(files)
+
+    if retention_days > 0:
+        cutoff = datetime.now() - timedelta(days=retention_days)
+        for path in list(keep):
+            mtime = datetime.fromtimestamp(path.stat().st_mtime)
+            if mtime < cutoff:
+                path.unlink()
+                keep.remove(path)
+                removed += 1
+                logger.info("已清理过期备份(按天数): %s", path.name)
+
+    if retention_count > 0 and len(keep) > retention_count:
+        for path in keep[retention_count:]:
             path.unlink()
             removed += 1
-            logger.info("已清理过期备份: %s", path.name)
+            logger.info("已清理过期备份(按份数): %s", path.name)
+
     if removed:
         logger.info("任务 %s 共清理 %d 个过期备份", name, removed)
 
@@ -657,6 +710,7 @@ def execute_task(
         global_cfg.get("notify_on_success", False),
     )
     retention_days = int(task.get("retention_days", global_cfg.get("retention_days", 30)))
+    retention_count = int(task.get("retention_count", global_cfg.get("retention_count", 0)))
 
     logger.info("======== 开始备份任务: %s ========", name)
     backup_file: Optional[Path] = None
@@ -676,7 +730,14 @@ def execute_task(
             raise ValueError(f"不支持的备份类型: {task_type}")
 
         size_bytes = backup_file.stat().st_size if backup_file else 0
-        cleanup_old_backups(backup_dir, name, retention_days, extensions, logger)
+        cleanup_old_backups(
+            backup_dir,
+            name,
+            retention_days,
+            extensions,
+            logger,
+            retention_count=retention_count,
+        )
 
         end = datetime.now()
         result = BackupResult(name, True, start, end, backup_file, size_bytes, task_type=task_type)
@@ -708,6 +769,69 @@ def execute_task(
         if history:
             history.add(result)
         return result
+
+
+class TaskRunner:
+    """共享任务运行器：防止同一任务被调度器与 Web 重复触发。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._running: Dict[str, datetime] = {}
+
+    def is_running(self, name: str) -> bool:
+        with self._lock:
+            return name in self._running
+
+    def list_running(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [
+                {
+                    "name": name,
+                    "started_at": started.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                for name, started in sorted(self._running.items())
+            ]
+
+    def try_acquire(self, name: str) -> bool:
+        with self._lock:
+            if name in self._running:
+                return False
+            self._running[name] = datetime.now()
+            return True
+
+    def release(self, name: str) -> None:
+        with self._lock:
+            self._running.pop(name, None)
+
+    def run(
+        self,
+        task: Dict[str, Any],
+        global_cfg: Dict[str, Any],
+        notifier: Notifier,
+        logger: logging.Logger,
+        history: Optional[HistoryStore] = None,
+    ) -> BackupResult:
+        name = task["name"]
+        if not self.try_acquire(name):
+            now = datetime.now()
+            result = BackupResult(
+                name,
+                False,
+                now,
+                now,
+                error=f"任务 {name} 正在运行中，已跳过",
+                task_type=task.get("type", ""),
+            )
+            logger.warning("任务 %s 正在运行中，跳过本次触发", name)
+            return result
+        try:
+            return execute_task(task, global_cfg, notifier, logger, history)
+        finally:
+            self.release(name)
+
+
+# 进程内全局 runner，供 CLI / 调度器 / Web 共用
+task_runner = TaskRunner()
 
 
 # ---------------------------------------------------------------------------
@@ -756,13 +880,18 @@ def run_tasks_now(
             continue
         if task_filter and task["name"] != task_filter:
             continue
-        results.append(execute_task(task, global_cfg, notifier, logger, history))
+        results.append(task_runner.run(task, global_cfg, notifier, logger, history))
     return results
 
 
-def build_task_info(task: Dict[str, Any], global_cfg: Dict[str, Any]) -> Dict[str, Any]:
+def build_task_info(
+    task: Dict[str, Any],
+    global_cfg: Dict[str, Any],
+    runner: Optional[TaskRunner] = None,
+) -> Dict[str, Any]:
     schedule = task.get("schedule")
     now = datetime.now()
+    runner = runner or task_runner
     info: Dict[str, Any] = {
         "name": task["name"],
         "type": task["type"].lower(),
@@ -770,6 +899,8 @@ def build_task_info(task: Dict[str, Any], global_cfg: Dict[str, Any]) -> Dict[st
         "enabled": task.get("enabled", True),
         "schedule": schedule,
         "retention_days": task.get("retention_days", global_cfg.get("retention_days", 30)),
+        "retention_count": task.get("retention_count", global_cfg.get("retention_count", 0)),
+        "running": runner.is_running(task["name"]),
     }
     if schedule and task.get("enabled", True):
         nxt = get_next_run(schedule, now)
@@ -877,7 +1008,7 @@ class Scheduler:
             for task in due:
                 if not self._running:
                     break
-                execute_task(task, self.global_cfg, self.notifier, self.logger, self.history)
+                task_runner.run(task, self.global_cfg, self.notifier, self.logger, self.history)
                 self._last_run[task["name"]] = datetime.now()
 
             if not self._running:
@@ -922,6 +1053,7 @@ def build_parser() -> argparse.ArgumentParser:
   %(prog)s -c config.yaml --now -t mysql_prod  立即执行指定任务
   %(prog)s -c config.yaml --next       查看下次执行时间
   %(prog)s -c config.yaml --web        启动 Web 管理界面
+  %(prog)s -c config.yaml --test-notify 测试通知渠道
   %(prog)s --encrypt-password 'secret' 加密密码（需 AUTOBACKUP_KEY）
         """,
     )
@@ -931,6 +1063,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-t", "--task", help="指定任务名称（配合 --now 使用）")
     parser.add_argument("-v", "--verbose", action="store_true", help="详细日志输出")
     parser.add_argument("--encrypt-password", metavar="PASSWORD", help="加密密码并输出 enc: 字符串")
+    parser.add_argument("--test-notify", action="store_true", help="向已启用的通知渠道发送测试消息")
     parser.add_argument("--web", action="store_true", help="启动 Web 管理界面")
     parser.add_argument("--host", default=None, help="Web 监听地址 (默认 0.0.0.0)")
     parser.add_argument("--port", type=int, default=None, help="Web 监听端口 (默认 8080)")
@@ -962,6 +1095,23 @@ def main() -> int:
     logger = setup_logging(log_dir, verbose=args.verbose)
     notifier = Notifier(config, logger)
     history = HistoryStore(log_dir)
+
+    if args.test_notify:
+        results = notifier.test()
+        enabled = [k for k, v in results.items() if not v.get("skipped")]
+        if not enabled:
+            logger.error("未启用任何通知渠道，请在 config.yaml 的 notification 中启用至少一种")
+            return 1
+        failed = 0
+        for name, item in results.items():
+            if item.get("skipped"):
+                logger.info("  [%s] 跳过（未启用）", name)
+            elif item.get("ok"):
+                logger.info("  [%s] 发送成功", name)
+            else:
+                failed += 1
+                logger.error("  [%s] 发送失败: %s", name, item.get("error"))
+        return 1 if failed else 0
 
     if args.web:
         from web import run_web_server

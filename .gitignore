@@ -8,3 +8,5 @@ config.yaml
 .idea/
 .DS_Store
 *.iml
+docs/
+scripts/

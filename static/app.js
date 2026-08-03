@@ -121,10 +121,17 @@ async function loadDashboard() {
 
     const badge = document.getElementById("scheduler-badge");
     const running = status.scheduler_running;
+    const runningCount = status.running_count || 0;
     badge.className = `status-pill${running ? " running" : ""}`;
     badge.innerHTML = `
       <span class="status-dot"></span>
-      <span class="status-text">${running ? "调度器运行中" : "调度器未运行"}</span>
+      <span class="status-text">${
+        runningCount > 0
+          ? `备份中 ${runningCount} 个`
+          : running
+            ? "调度器运行中"
+            : "调度器未运行"
+      }</span>
     `;
 
     document.getElementById("stat-tasks").textContent = status.task_count;
@@ -214,12 +221,17 @@ async function loadTasks() {
         <td class="mono">${esc(t.schedule || "-")}</td>
         <td>${t.next_run ? esc(t.next_run) : "-"}<br>
           <span class="text-muted">${formatCountdown(t.next_run_in_seconds)}</span></td>
-        <td>${t.enabled
-          ? '<span class="badge badge-success">启用</span>'
-          : '<span class="badge badge-muted">禁用</span>'}</td>
+        <td>
+          ${t.running ? '<span class="badge badge-warning">运行中</span> '
+            : t.enabled
+              ? '<span class="badge badge-success">启用</span>'
+              : '<span class="badge badge-muted">禁用</span>'}
+        </td>
         <td>
           <div class="btn-group">
-            <button class="btn btn-success btn-sm" onclick="runTask('${esc(t.name)}')">立即备份</button>
+            <button class="btn btn-success btn-sm" onclick="runTask('${esc(t.name)}')" ${t.running ? "disabled" : ""}>
+              ${t.running ? "运行中…" : "立即备份"}
+            </button>
             <button class="btn btn-ghost btn-sm" onclick="toggleTask('${esc(t.name)}')">
               ${t.enabled ? "禁用" : "启用"}
             </button>
@@ -237,9 +249,11 @@ async function runTask(name) {
   try {
     const data = await api(`/api/tasks/${encodeURIComponent(name)}/run`, { method: "POST" });
     toast(data.message);
-    setTimeout(refreshCurrentPage, 2000);
+    loadTasks();
+    setTimeout(refreshCurrentPage, 2500);
   } catch (e) {
     toast(e.message, "error");
+    loadTasks();
   }
 }
 
@@ -248,6 +262,19 @@ async function toggleTask(name) {
     const data = await api(`/api/tasks/${encodeURIComponent(name)}/toggle`, { method: "POST" });
     toast(data.message);
     loadTasks();
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+async function testNotify() {
+  try {
+    const data = await api("/api/notify/test", { method: "POST" });
+    if (data.ok) {
+      toast(data.message || "测试通知已发送");
+    } else {
+      toast(data.message || data.error || "部分渠道失败", "error");
+    }
   } catch (e) {
     toast(e.message, "error");
   }
@@ -385,5 +412,6 @@ document.addEventListener("DOMContentLoaded", () => {
   switchPage("dashboard");
   setInterval(() => {
     if (currentPage === "dashboard") loadDashboard();
-  }, 30000);
+    if (currentPage === "tasks") loadTasks();
+  }, 5000);
 });

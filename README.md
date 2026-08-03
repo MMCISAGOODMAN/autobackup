@@ -1,6 +1,6 @@
 # autobackup
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/MMCISAGOODMAN/autobackup)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](https://github.com/MMCISAGOODMAN/autobackup)
 [![Python](https://img.shields.io/badge/python-3.8%2B-green.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
 
@@ -34,11 +34,11 @@
 |------|------|
 | 备份源 | MySQL（mysqldump）、PostgreSQL（pg_dump）、文件目录（tar + gzip） |
 | 调度 | Cron 表达式定时执行，支持 `--now` 立即备份、`--next` 查看下次执行时间 |
-| 备份管理 | 时间戳命名、自动 gzip 压缩、按保留天数自动清理过期备份 |
-| 通知 | 失败必通知，成功可选；支持邮件、钉钉、企业微信、飞书 |
+| 备份管理 | 时间戳命名、自动 gzip 压缩、按天数/份数清理过期备份 |
+| 通知 | 失败必通知，成功可选；支持邮件、钉钉、企业微信、飞书；`--test-notify` 测试 |
 | 日志 | 按天轮转，记录开始/结束时间、大小、状态、错误信息 |
-| Web 界面 | 仪表盘、任务管理、备份浏览/下载/删除、执行历史、日志、在线配置 |
-| 安全 | 环境变量/加密密码、备份文件权限 600、Web Token 认证 |
+| Web 界面 | 仪表盘、任务运行状态、备份管理、执行历史、日志、在线配置、通知测试 |
+| 安全 | 环境变量/加密密码、备份文件权限 600、Web Token 认证；防任务重复执行 |
 
 ---
 
@@ -165,6 +165,7 @@ python3 autobackup.py -c config.yaml --web
 | `--port` | Web 监听端口 | `--port 9000` |
 | `-v, --verbose` | 输出详细日志 | `-v` |
 | `--encrypt-password` | 加密密码并输出 `enc:` 字符串 | `--encrypt-password 'secret'` |
+| `--test-notify` | 向已启用通知渠道发送测试消息 | `--test-notify` |
 | `--version` | 显示版本号 | `--version` |
 
 ### 常用场景
@@ -180,6 +181,9 @@ python3 autobackup.py --version
 export AUTOBACKUP_KEY='your-master-key'
 python3 autobackup.py --encrypt-password 'db_password'
 # 将输出的 enc:gAAAAA... 写入 config.yaml
+
+# 测试通知渠道
+python3 autobackup.py -c config.yaml --test-notify
 
 # 单独启动 Web 服务
 python3 web.py -c config.yaml --host 0.0.0.0 --port 8080
@@ -242,6 +246,7 @@ global:
 | GET | `/api/history` | 执行历史 |
 | GET | `/api/logs` | 运行日志 |
 | GET/POST | `/api/config` | 读取/保存配置 |
+| POST | `/api/notify/test` | 测试通知渠道 |
 
 ---
 
@@ -255,13 +260,16 @@ global:
 global:
   backup_dir: ./backups       # 备份文件存放目录
   log_dir: ./logs             # 日志目录
-  retention_days: 30          # 默认保留天数（过期自动删除）
+  retention_days: 30          # 默认保留天数（0=不按天清理）
+  retention_count: 0          # 默认最多保留份数（0=不按份数清理）
   notify_on_success: false    # 备份成功时是否发送通知
   web:
     host: 0.0.0.0             # Web 监听地址
     port: 8080                # Web 监听端口
     token: ${WEB_TOKEN}       # 访问 Token（可选）
 ```
+
+> 同时配置天数与份数时：先按天数删除，再裁剪到最多 N 份。
 
 ### 任务配置 `tasks`
 
@@ -273,7 +281,8 @@ global:
 | `type` | 是 | `mysql` / `postgresql` / `file` |
 | `enabled` | 否 | 是否启用（默认 `true`） |
 | `schedule` | 否 | Cron 表达式 |
-| `retention_days` | 否 | 覆盖全局保留天数 |
+| `retention_days` | 否 | 覆盖全局保留天数（0=不按天） |
+| `retention_count` | 否 | 覆盖全局保留份数（0=不按份数） |
 | `backup_dir` | 否 | 覆盖全局备份目录 |
 | `notify_on_success` | 否 | 覆盖全局成功通知设置 |
 
@@ -285,6 +294,7 @@ global:
   enabled: true
   schedule: "0 2 * * *"
   retention_days: 7
+  retention_count: 14
   database:
     host: localhost
     port: 3306
